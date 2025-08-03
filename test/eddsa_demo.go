@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -101,6 +100,7 @@ func createParties(ca tlsgen.CA, certPool *x509.CertPool, baseLogger *zap.Logger
 	var listeners []net.Listener
 	var commParties []*comm.Party
 	var loggers []*commLogger
+	var signers []*tlsgen.CertKeyPair
 
 	// Membership mapping
 	membership := make(map[UniversalID]PartyID)
@@ -110,6 +110,18 @@ func createParties(ca tlsgen.CA, certPool *x509.CertPool, baseLogger *zap.Logger
 
 	membershipFunc := func() map[UniversalID]PartyID {
 		return membership
+	}
+
+	// Create shared TLS certificate for all parties
+	tlsCert, err := ca.NewServerCertKeyPair("127.0.0.1")
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create shared TLS cert: %v", err)
+	}
+
+	// Pre-create all client certificates
+	for id := 1; id <= totalParties; id++ {
+		s := newSigner(ca)
+		signers = append(signers, s)
 	}
 
 	// Create parties
@@ -127,13 +139,7 @@ func createParties(ca tlsgen.CA, certPool *x509.CertPool, baseLogger *zap.Logger
 		}
 		loggers = append(loggers, logger)
 
-		// Create TLS certificate for this party
-		tlsCert, err := ca.NewServerCertKeyPair("127.0.0.1")
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to create TLS cert for party %d: %v", id, err)
-		}
-
-		// Create network listener
+		// Create network listener using shared TLS certificate
 		listener := comm.Listen("127.0.0.1:0", tlsCert.Cert, tlsCert.Key)
 		listeners = append(listeners, listener)
 
@@ -141,7 +147,7 @@ func createParties(ca tlsgen.CA, certPool *x509.CertPool, baseLogger *zap.Logger
 		commParty := &comm.Party{
 			Logger:   logger,
 			Address:  listener.Addr().String(),
-			Identity: tlsCert.Cert,
+			Identity: signers[id-1].Cert,
 		}
 		commParties = append(commParties, commParty)
 	}
@@ -151,7 +157,7 @@ func createParties(ca tlsgen.CA, certPool *x509.CertPool, baseLogger *zap.Logger
 		party, stop, err := createMPCParty(
 			uint16(id),
 			loggers[id-1],
-			ca,
+			signers[id-1],
 			certPool,
 			listeners,
 			commParties,
@@ -170,29 +176,23 @@ func createParties(ca tlsgen.CA, certPool *x509.CertPool, baseLogger *zap.Logger
 func createMPCParty(
 	id uint16,
 	logger *commLogger,
-	ca tlsgen.CA,
+	signer *tlsgen.CertKeyPair,
 	certPool *x509.CertPool,
 	listeners []net.Listener,
 	commParties []*comm.Party,
 	membershipFunc func() map[UniversalID]PartyID,
 ) (MpcParty, func(), error) {
-	// Create client certificate for authentication
-	clientPair, err := ca.NewClientCertKeyPair()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create client cert: %v", err)
-	}
-
 	// Set up remote parties communication
 	remoteParties := make(comm.SocketRemoteParties)
 
 	auth := func(tlsContext []byte) comm.Handshake {
 		h := comm.Handshake{
 			TLSBinding: tlsContext,
-			Identity:   clientPair.Cert,
+			Identity:   signer.Cert,
 			Timestamp:  time.Now().Unix(),
 		}
 
-		sig, err := clientPair.Sign(rand.Reader, sha256Digest(h.Bytes()), crypto.Hash(0))
+		sig, err := signer.Sign(rand.Reader, sha256Digest(h.Bytes()), nil)
 		if err != nil {
 			panic(fmt.Sprintf("failed signing: %v", err))
 		}
@@ -237,7 +237,7 @@ func createMPCParty(
 	}
 
 	// Create MPC scheme
-	scheme := threshold.LoudScheme(id, logger, kgf, sf, signThreshold-1, remoteParties.Send, membershipFunc)
+	scheme := threshold.LoudScheme(id, logger, kgf, sf, len(commParties)-1, remoteParties.Send, membershipFunc)
 
 	// Start message handler
 	go func(in <-chan comm.InMsg) {
@@ -412,4 +412,12 @@ func equalBytes(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+func newSigner(ca tlsgen.CA) *tlsgen.CertKeyPair {
+	clientPair, err := ca.NewClientCertKeyPair()
+	if err != nil {
+		panic(fmt.Sprintf("failed to create client key pair: %v", err))
+	}
+	return clientPair
 }
